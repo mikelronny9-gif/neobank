@@ -497,7 +497,7 @@ Content-Type: `+_.contentType+`\r
       if (email && uid) window.__neoUidMap[email.toLowerCase()]={uid:uid,email:email,status:status};
       if (uid) window.__neoUidMap['__uid__'+uid]={uid:uid,email:email,status:status};
       if (isAdmin) window.__neoIsAdmin=true;
-      if (status==='suspended'&&!window.__neoIsAdmin) setTimeout(showBanned,800);
+      /* Suspended users see their own account normally — React app shows the status inline */
     } catch(ex){}
   }
 
@@ -679,14 +679,41 @@ Content-Type: `+_.contentType+`\r
   setTimeout(function(){ getTok(function(tok){ if(tok&&!_cryptoCache) getCryptoSettings(function(){}); }); }, 1200);
 
   /* ══════════════════════════════════════════════════════════════════════
-     BANNED OVERLAY
+     ADMIN: SORT USER CARDS — NEWEST FIRST
+     Runs whenever the card count changes so new registrations bubble to top.
   ══════════════════════════════════════════════════════════════════════ */
-  function showBanned(){
-    if(window.__neoIsAdmin||document.getElementById('__neo_b')) return;
-    var el=document.createElement('div'); el.id='__neo_b';
-    el.style.cssText='position:fixed;inset:0;z-index:2147483647;background:#0a0a0a;display:flex;flex-direction:column;align-items:center;justify-content:center;font-family:Inter,sans-serif;color:#fff;text-align:center;padding:32px';
-    el.innerHTML='<div style="font-size:54px;margin-bottom:18px">&#9940;</div><div style="font-size:22px;font-weight:700;margin-bottom:10px">Account Suspended</div><div style="font-size:14px;color:#9ca3af;max-width:300px;line-height:1.6">Your account has been suspended by an administrator.<br>Contact support for assistance.</div>';
-    document.body.appendChild(el);
+  var _lastCardCount = -1;
+
+  function sortAdminUserCards(){
+    if(!isAdminPage()) return;
+
+    /* User cards contain both "Add Funds" and "Remove Funds" buttons */
+    var allDivs = Array.prototype.slice.call(document.querySelectorAll('div,li,article,section'));
+    var cards = allDivs.filter(function(el){
+      var texts = {};
+      el.querySelectorAll('button').forEach(function(b){
+        var t=(b.textContent||'').trim().toLowerCase();
+        if(t==='add funds') texts.add=true;
+        if(t==='remove funds') texts.rm=true;
+      });
+      return texts.add && texts.rm;
+    });
+
+    if(cards.length < 1) return;
+
+    /* Only re-sort when count changes (avoids fighting React on every mutation) */
+    if(cards.length === _lastCardCount) return;
+    _lastCardCount = cards.length;
+
+    /* All cards must share the same direct parent */
+    var parent = cards[0].parentElement;
+    if(!parent) return;
+    if(!cards.every(function(c){ return c.parentElement===parent; })) return;
+
+    /* Reverse order → newest (last-added in Firestore scan) appears first */
+    cards.slice().reverse().forEach(function(card){
+      parent.insertBefore(card, parent.firstChild);
+    });
   }
 
   /* ══════════════════════════════════════════════════════════════════════
@@ -1267,7 +1294,9 @@ Content-Type: `+_.contentType+`\r
     /* 3. Admin wallet FAB — show whenever admin panel is visible */
     if(isAdminPage()) injectAdminWalletPanel();
     else hideFab();
-    /* 4. Coming Soon on card/bank buttons */
+    /* 4. Sort user cards: newest first */
+    sortAdminUserCards();
+    /* 5. Coming Soon on card/bank buttons */
     patchCardBankElements();
   }
 
