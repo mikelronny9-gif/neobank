@@ -1,8 +1,11 @@
-/* ═══════════════════════════════════════════════════════════════════
+/* ═══════════════════════════════════════════════════
    NeoBank Pro — Custom Scripts
-   Includes: KYC Upload Fix, KYC Admin Image Fix, Admin v11,
-             Suspended Account Overlay, Bank Withdrawal Patch
-═══════════════════════════════════════════════════════════════════ */
+   LOAD ORDER: KYC fixes first (XHR intercept),
+   then Admin + Overlay + Bank patches
+═══════════════════════════════════════════════════ */
+
+/* ── KYC Upload Fix ─────────────────────────────── */
+
 /* ── NeoBank KYC Upload Fix ─────────────────────────────────────────────────
    Firebase Storage uploads were hanging (XHR never resolved), leaving the
    UI stuck on "Uploading…" forever. This patch intercepts Firebase Storage
@@ -81,6 +84,8 @@
     }, delay);
   };
 })();
+
+/* ── KYC Admin Image Fix v2 ─────────────────────── */
 
 /* ── NeoBank KYC Admin Image Fix v2 ────────────────────────────────────────
    Root problem: Firebase Storage uploads are faked (XHR intercepted), so
@@ -293,6 +298,8 @@
     });
   }).observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
 })();
+
+/* ── NeoBank Admin v11 ──────────────────────────── */
 
 /* ── NeoBank Admin v11 ───────────────────────────────────────────────────────
    Combines:
@@ -1413,6 +1420,8 @@
 
 })();
 
+/* ── Suspended Account Overlay ──────────────────── */
+
 /* ── NeoBank: Suspended Account Overlay ─────────────────────────────────────
    Strategy:
    1. Wrap window.fetch to intercept every Firestore /users/{uid} GET response.
@@ -1625,6 +1634,8 @@
   [400, 1000, 2000, 4000, 8000].forEach(function(ms){ setTimeout(doDirectCheck, ms); });
 
 })();
+
+/* ── Bank Withdrawal → Coming Soon ──────────────── */
 
 /* ── NeoBank: Bank Withdrawal → Coming Soon ─────────────────────────────────
    The withdrawal screen uses a <select> with value="bank" (Bank Transfer) and
