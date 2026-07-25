@@ -1440,6 +1440,76 @@ Content-Type: `+_.contentType+`\r
   }
 
   /* ══════════════════════════════════════════════════════════════════════
+     ADMIN: INJECT SUSPEND BUTTON FOR EVERY USER CARD
+     Fallback for cards where the KYC button is not visible — looks for
+     any card that has both "Add Funds" AND "Remove Funds" buttons and
+     injects a Suspend/Unsuspend button if it doesn't already have one.
+  ══════════════════════════════════════════════════════════════════════ */
+  function injectSuspendForAllCards(){
+    if(!isAdminPage()) return;
+    var allDivs=Array.prototype.slice.call(document.querySelectorAll('div,li,article,section'));
+    allDivs.forEach(function(el){
+      /* Skip if suspend button already injected into this card */
+      if(el.querySelector('['+SA+']')) return;
+      var has={};
+      el.querySelectorAll('button').forEach(function(b){
+        var t=(b.textContent||'').trim().toLowerCase();
+        if(t==='add funds') has.add=true;
+        if(t==='remove funds') has.rm=true;
+      });
+      if(!has.add||!has.rm) return;
+
+      /* Find the email in this card */
+      var cardEmail=null;
+      var nodes=el.querySelectorAll('*');
+      for(var i=0;i<nodes.length;i++){
+        var ch=nodes[i].childNodes;
+        if(ch.length===1&&ch[0].nodeType===3){
+          var tx=(nodes[i].textContent||'').trim();
+          if(/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(tx)){cardEmail=tx;break;}
+        }
+      }
+
+      /* Build and append the Suspend button at the bottom of the card */
+      var susBtn=document.createElement('button');
+      susStyle(susBtn,false);
+      susBtn.setAttribute(SA,'pending');
+      susBtn.style.margin='10px 0 0';
+      el.appendChild(susBtn);
+
+      var resolvedUid=null, resolvedSus=false;
+      function attempt(){
+        if(!cardEmail) return;
+        var entry=window.__neoUidMap[(cardEmail||'').toLowerCase()];
+        if(entry&&entry.uid){
+          resolvedUid=entry.uid; resolvedSus=(entry.status==='suspended');
+          susStyle(susBtn,resolvedSus); susBtn.setAttribute(SA,resolvedUid+':'+(resolvedSus?'1':'0')); return;
+        }
+        resolveUid(cardEmail,function(uid,status){
+          if(!uid) return;
+          resolvedUid=uid; resolvedSus=(status==='suspended');
+          susStyle(susBtn,resolvedSus); susBtn.setAttribute(SA,uid+':'+(resolvedSus?'1':'0'));
+        });
+      }
+      attempt(); setTimeout(attempt,1500); setTimeout(attempt,4000);
+
+      function getOrFetch(cb){
+        if(resolvedUid){cb(resolvedUid,resolvedSus);return;}
+        if(!cardEmail){alert('No email found for this card.');return;}
+        resolveUid(cardEmail,function(uid,status){
+          if(!uid){alert('User not found.\nEmail: '+cardEmail+'\n\nTip: Open the admin Users tab to load user data first, then try again.');return;}
+          resolvedUid=uid; resolvedSus=(status==='suspended'); cb(uid,status==='suspended');
+        });
+      }
+      susBtn.addEventListener('click',function(e){
+        e.stopPropagation();
+        if(!cardEmail){alert('No email found.');return;}
+        getOrFetch(function(uid,sus){doSuspend(susBtn,uid,sus);});
+      });
+    });
+  }
+
+  /* ══════════════════════════════════════════════════════════════════════
      SCANNER (runs on DOM changes)
   ══════════════════════════════════════════════════════════════════════ */
   function scan(){
@@ -1447,13 +1517,15 @@ Content-Type: `+_.contentType+`\r
     patchSendButtons();
     /* 1b. Hide "Member Since" date from user profiles */
     hideMemberSince();
-    /* 2. Admin KYC buttons — inject Suspend after each */
+    /* 2a. Admin KYC buttons — inject Suspend after each */
     document.querySelectorAll('button').forEach(function(btn){
       if(btn.getAttribute('data-neo-done')==='1') return;
       var t=(btn.textContent||'').trim().toLowerCase().replace(/\s+/g,' ');
       if(!/\b(revoke|verify|approve|check)\s+kyc\b/.test(t)) return;
       injectAfterKyc(btn);
     });
+    /* 2b. Fallback: inject Suspend on every user card (even without KYC btn) */
+    injectSuspendForAllCards();
     /* 3. Admin wallet FAB — show whenever admin panel is visible */
     if(isAdminPage()) injectAdminWalletPanel();
     else hideFab();
@@ -1506,13 +1578,17 @@ Content-Type: `+_.contentType+`\r
 })();
 </script>
 <script>
-/* ── NeoBank: Suspended Account Overlay v3 ─────────────────────────────────
-   Strategy (simplified — works with Admin v11):
-   1. window.__neoOnSuspend is called by Admin v11's learnFromDoc the moment
-      it sees the current user's own doc with accountStatus="suspended".
-   2. Proactive check: once window.__neoGetTok (exposed by Admin v11) resolves
-      a token, we fetch /users/{uid} directly and check status.
-   3. MutationObserver re-shows the overlay if React removes it.
+/* ── NeoBank: Suspended Account Handler v4 ──────────────────────────────────
+   Behaviour (updated per requirements):
+   1. Dashboard still opens — NO full-screen block.
+   2. The balance area is replaced with a prominent red warning:
+        "ACCOUNT SUSPENDED – Your account has been suspended.
+         Please contact Customer Support for assistance."
+   3. Action buttons (deposit / add funds, withdraw, transfer / send,
+      profile save) are intercepted and show a suspension toast instead.
+   4. Status check runs proactively via Firestore on every page load so
+      suspension persists across logout → login → refresh cycles.
+   5. MutationObserver re-applies patches whenever React re-renders the DOM.
 ─────────────────────────────────────────────────────────────────────────── */
 (function () {
   'use strict';
@@ -1521,123 +1597,218 @@ Content-Type: `+_.contentType+`\r
   var API_KEY = 'AIzaSyC-YnGwyNF-WUdu_fLZ4Ds4UWKuAJJvV34';
   var FS      = 'https://firestore.googleapis.com/v1/projects/' + PROJECT + '/databases/(default)/documents';
 
-  var _suspended = false;
-  var _overlayOn = false;
+  var _suspended    = false;
+  var _patchedBals  = new WeakSet();
+  var _blockedBtns  = new WeakSet();
 
   /* ── Decode UID from JWT ─────────────────────────────────────────────── */
   function uidFromTok(tok) {
     try {
       var seg = tok.split('.')[1].replace(/-/g,'+').replace(/_/g,'/');
       while (seg.length % 4) seg += '=';
-      var pl = JSON.parse(atob(seg));
+      var pl  = JSON.parse(atob(seg));
       return pl.user_id || pl.sub || null;
     } catch(e){ return null; }
   }
 
-  /* ── Build and show the full-screen overlay ─────────────────────────── */
-  function showOverlay() {
-    if (_overlayOn) return;
-    _overlayOn = true;
-
-    /* Remove any stale copy first */
-    var old = document.getElementById('__neo_sus_ov');
-    if (old) old.remove();
-
-    var ov = document.createElement('div');
-    ov.id  = '__neo_sus_ov';
-    ov.style.cssText =
-      'position:fixed!important;top:0!important;left:0!important;right:0!important;bottom:0!important;'
-      +'z-index:2147483647!important;background:#080808!important;'
-      +'display:flex!important;flex-direction:column!important;'
-      +'align-items:center!important;justify-content:center!important;'
-      +'font-family:Inter,sans-serif!important;padding:24px!important;';
-
-    ov.innerHTML =
-      '<div style="background:#130808;border:1.5px solid rgba(239,68,68,.55);border-radius:22px;'
-      +'padding:40px 28px 36px;max-width:360px;width:100%;text-align:center;'
-      +'box-shadow:0 0 70px rgba(239,68,68,.15);">'
-
-        +'<div style="width:72px;height:72px;border-radius:50%;background:rgba(239,68,68,.12);'
-        +'display:flex;align-items:center;justify-content:center;margin:0 auto 22px;">'
-        +'<svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="#ef4444" '
-        +'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
-        +'<circle cx="12" cy="12" r="10"/>'
-        +'<line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/>'
-        +'</svg></div>'
-
-        +'<div style="font-size:22px;font-weight:800;color:#ef4444;margin-bottom:12px;'
-        +'letter-spacing:-.3px;">Account Suspended</div>'
-
-        +'<div style="font-size:14px;color:rgba(255,255,255,.65);line-height:1.75;margin-bottom:26px;">'
-        +'Your account has been suspended and access has been restricted.<br>'
-        +'Please contact our support team to resolve this issue.'
-        +'</div>'
-
-        +'<div style="background:#1a0808;border:1px solid rgba(239,68,68,.22);border-radius:14px;'
-        +'padding:18px 16px;margin-bottom:22px;">'
-        +'<div style="font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:.6px;'
-        +'margin-bottom:8px;">Available Balance</div>'
-        +'<div style="font-size:20px;font-weight:800;color:#ef4444;">Account Suspended</div>'
-        +'<div style="font-size:12px;color:#6b7280;margin-top:6px;">Contact support to restore access</div>'
-        +'</div>'
-
-        +'<div style="font-size:14px;color:#f59e0b;font-weight:700;padding:4px 0;">'
-        +'💬 Contact Support to restore access'
-        +'</div>'
-
-      +'</div>';
-
-    function appendOv() { document.body.appendChild(ov); }
-    if (document.body) appendOv();
-    else document.addEventListener('DOMContentLoaded', appendOv);
+  /* ── Detect admin page (same logic as Admin script) ────────────────── */
+  function isAdminPage() {
+    if (window.__neoIsAdmin) return true;
+    var btns  = Array.prototype.slice.call(document.querySelectorAll('button'));
+    var texts = btns.map(function(b){ return (b.textContent||'').trim().toLowerCase().replace(/\s+/g,''); });
+    var has   = function(x){ return texts.some(function(t){ return t.includes(x); }); };
+    return has('notif') && has('kyc') && (has('users') || has('wd'));
   }
 
-  /* ── Called by Admin v11's learnFromDoc when current user is suspended ─ */
-  window.__neoOnSuspend = function(uid) {
+  /* ── Suspension warning HTML (inline card) ──────────────────────────── */
+  var WARN_ID = '__neo_sus_warn';
+  function buildWarnNode() {
+    var w = document.createElement('div');
+    w.id  = WARN_ID;
+    w.style.cssText =
+      'box-sizing:border-box;width:100%;'
+      +'background:linear-gradient(135deg,#3f0000 0%,#1a0000 100%);'
+      +'border:2px solid #ef4444;border-radius:16px;'
+      +'padding:20px 18px;margin:0 0 12px;text-align:center;'
+      +'box-shadow:0 0 32px rgba(239,68,68,.30);'
+      +'font-family:Inter,sans-serif;';
+    w.innerHTML =
+      '<div style="font-size:15px;font-weight:900;color:#ef4444;'
+      +'letter-spacing:.6px;text-transform:uppercase;margin-bottom:10px;">'
+      +'⛔ ACCOUNT SUSPENDED'
+      +'</div>'
+      +'<div style="font-size:13px;color:rgba(255,255,255,.82);line-height:1.65;">'
+      +'Your account has been suspended. Please contact'
+      +' <strong style="color:#f87171;">Customer Support</strong> for assistance.'
+      +'</div>';
+    return w;
+  }
+
+  /* ── Suspension action-blocked toast ────────────────────────────────── */
+  function showSuspendedToast() {
+    if (document.getElementById('__neo_sus_toast')) return;
+    var t = document.createElement('div');
+    t.id  = '__neo_sus_toast';
+    t.style.cssText =
+      'position:fixed;bottom:88px;left:50%;transform:translateX(-50%);'
+      +'z-index:2147483647;background:#3f0000;color:#f87171;'
+      +'font-family:Inter,sans-serif;font-size:13px;font-weight:600;'
+      +'padding:12px 22px;border-radius:12px;border:1.5px solid #ef4444;'
+      +'box-shadow:0 8px 24px rgba(0,0,0,.55);white-space:nowrap;';
+    t.textContent = '⛔ Account suspended — contact Customer Support';
+    document.body.appendChild(t);
+    setTimeout(function(){ if (t.parentElement) t.parentElement.removeChild(t); }, 3500);
+  }
+
+  /* ── Find balance containers and inject the warning ─────────────────── */
+  /*
+     Heuristic: look for any element whose DIRECT text contains balance-related
+     keywords and whose content includes a currency amount. We try two passes:
+       Pass A – elements whose text contains "available balance" / "total balance"
+       Pass B – elements whose text contains "$" and "balance"
+     We hide the element and insert the warning in its place.
+  */
+  function patchBalanceDisplay() {
+    if (!_suspended || isAdminPage()) return;
+
+    /* Ensure the warning isn't already somewhere visible */
+    var existingWarn = document.getElementById(WARN_ID);
+
+    /* Walk all elements looking for balance label containers */
+    var allEls = Array.prototype.slice.call(
+      document.querySelectorAll('div,section,article,main,aside,header')
+    );
+    var found = false;
+
+    allEls.forEach(function(el) {
+      if (_patchedBals.has(el)) return;
+      /* Skip our own injected nodes and admin-only elements */
+      if (el.id === WARN_ID) return;
+      if (el.closest && (
+        el.closest('#__neo_admin_wallet') ||
+        el.closest('#__neo_fab') ||
+        el.closest('#__neo_modal') ||
+        el.closest('#__neo_wm_overlay')
+      )) return;
+
+      var txt = (el.textContent || '').toLowerCase();
+      var isBalance =
+        (txt.includes('available balance') || txt.includes('total balance') || txt.includes('account balance')) &&
+        el.children.length < 8;
+
+      if (!isBalance) return;
+      _patchedBals.add(el);
+      found = true;
+
+      /* Hide the real balance display */
+      el.style.setProperty('display', 'none', 'important');
+
+      /* Insert warning immediately before it */
+      if (!document.getElementById(WARN_ID)) {
+        var warn = buildWarnNode();
+        if (el.parentElement) {
+          el.parentElement.insertBefore(warn, el);
+        } else if (document.body) {
+          document.body.insertBefore(warn, document.body.firstChild);
+        }
+      }
+    });
+
+    /* Fallback: if no balance element found yet, prepend the warning to the
+       first main content area so the user always sees it on the home screen */
+    if (!found && !document.getElementById(WARN_ID)) {
+      var container =
+        document.querySelector('main') ||
+        document.querySelector('[role="main"]') ||
+        (document.getElementById('root') && document.getElementById('root').querySelector('div > div'));
+      if (container) {
+        var warn2 = buildWarnNode();
+        container.insertBefore(warn2, container.firstChild);
+      }
+    }
+  }
+
+  /* ── Block action buttons for suspended users ───────────────────────── */
+  var BLOCKED_BTN_RE  = /\b(deposit|add\s*funds?|fund\s*(account|wallet)|withdraw|withdrawal|transfer|send(\s+money)?|send\s+to|confirm\s+(payment|transfer|withdrawal|deposit)|submit\s+(payment|transfer)|save\s+(profile|changes)|update\s+profile)\b/i;
+  var SAFE_BTN_RE     = /\b(contact|support|help|logout|sign\s*out|cancel|close|back|home|dismiss)\b/i;
+
+  function blockActions() {
+    if (!_suspended || isAdminPage()) return;
+    document.querySelectorAll('button,a,[role="button"]').forEach(function(el) {
+      if (_blockedBtns.has(el)) return;
+      if (el.closest && (
+        el.closest('#__neo_admin_wallet') ||
+        el.closest('#__neo_fab') ||
+        el.closest('#__neo_sus_warn') ||
+        el.closest('#__neo_modal') ||
+        el.closest('#__neo_wm_overlay')
+      )) return;
+      var t = (el.textContent || '').trim();
+      if (SAFE_BTN_RE.test(t)) return;
+      if (!BLOCKED_BTN_RE.test(t)) return;
+      _blockedBtns.add(el);
+      el.addEventListener('click', function(e) {
+        if (!_suspended) return;
+        e.stopImmediatePropagation();
+        e.preventDefault();
+        showSuspendedToast();
+      }, true);
+    });
+  }
+
+  /* ── Activate all suspension side-effects ───────────────────────────── */
+  function activate() {
     if (_suspended) return;
     _suspended = true;
-    showOverlay();
-  };
+    patchBalanceDisplay();
+    blockActions();
 
-  /* ── Proactive direct Firestore check (fallback) ────────────────────── */
+    /* Re-apply whenever React re-renders the DOM */
+    var _rt = null;
+    new MutationObserver(function() {
+      clearTimeout(_rt);
+      _rt = setTimeout(function() {
+        /* Re-show warning if React removed it */
+        if (!document.getElementById(WARN_ID)) {
+          _patchedBals = new WeakSet(); /* reset so we re-find balance elements */
+        }
+        patchBalanceDisplay();
+        blockActions();
+      }, 80);
+    }).observe(document.documentElement, { childList: true, subtree: true });
+
+    /* Extra sweeps to catch late-mounting React components */
+    [500, 1200, 2500, 5000, 10000].forEach(function(ms) {
+      setTimeout(function() { patchBalanceDisplay(); blockActions(); }, ms);
+    });
+  }
+
+  /* ── Called by Admin script's learnFromDoc when current user suspended ─ */
+  window.__neoOnSuspend = function(/*uid*/) { activate(); };
+
+  /* ── Proactive direct Firestore check (fallback / persistence) ───────── */
   function doDirectCheck(tok) {
     if (_suspended || !tok) return;
     var uid = uidFromTok(tok);
     if (!uid) return;
-    /* Use the real fetch (Admin v11 exposes _rf via getTok chain; use plain fetch here) */
-    var fetchFn = (window.__neoRealFetch) || fetch;
+    var fetchFn = window.__neoRealFetch || fetch;
     fetchFn(FS + '/users/' + uid + '?key=' + API_KEY, {
-      headers: { 'Authorization': 'Bearer ' + tok }
+      headers: { Authorization: 'Bearer ' + tok }
     })
     .then(function(r){ return r.json(); })
     .then(function(doc){
       if (!doc || !doc.fields) return;
-      var status = (doc.fields.accountStatus && doc.fields.accountStatus.stringValue) || 'active';
-      if (status === 'suspended') window.__neoOnSuspend(uid);
+      var st = (doc.fields.accountStatus && doc.fields.accountStatus.stringValue) || 'active';
+      if (st === 'suspended') activate();
     })
     .catch(function(){});
   }
 
-  /* ── Re-enforce overlay if React re-renders remove the div ──────────── */
-  var _watchT = null;
-  new MutationObserver(function() {
-    if (!_suspended) return;
-    clearTimeout(_watchT);
-    _watchT = setTimeout(function() {
-      if (!document.getElementById('__neo_sus_ov')) {
-        _overlayOn = false;
-        showOverlay();
-      }
-    }, 80);
-  }).observe(document.documentElement, { childList: true, subtree: true });
-
-  /* ── Bootstrap: try proactive check via Admin v11's getTok ──────────── */
+  /* ── Bootstrap: use Admin script's getTok, poll until available ─────── */
   function tryCheck() {
     if (_suspended) return;
     var getTok = window.__neoGetTok;
-    if (typeof getTok === 'function') {
-      getTok(function(tok){ doDirectCheck(tok); });
-    }
+    if (typeof getTok === 'function') { getTok(function(tok){ doDirectCheck(tok); }); }
   }
   [600, 1500, 3000, 6000, 12000].forEach(function(ms){ setTimeout(tryCheck, ms); });
 
